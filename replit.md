@@ -16,6 +16,24 @@ pnpm workspace monorepo using TypeScript. Each package manages its own dependenc
 - **API codegen**: Orval (from OpenAPI spec)
 - **Build**: esbuild (CJS bundle)
 
+## Artifacts
+
+### Altea Intel — Luxury Real Estate Dashboard (`artifacts/altea-intel`)
+- **Type**: React + Vite (frontend-only, no backend)
+- **Preview path**: `/`
+- **Stack**: React, Tailwind CSS, Recharts, Lucide React, Wouter
+- **Theme**: Dark mode (Slate-900 bg, Amber-500 gold accents, Emerald green for gains)
+- **Features**:
+  - Sidebar navigation (Dashboard, Oportunidades, Análisis por Zona, Leads FB, Config)
+  - KPI cards: Avg price/m², New properties 24h, Best opportunity score, Total tracked
+  - Zone filter bar for 5 Altea zones
+  - Property opportunity grid with photo, score badge, source badge (Idealista/Facebook)
+  - Zone comparison bar chart (Recharts)
+  - Detailed table with sparkline price history (Recharts LineChart)
+  - Glassmorphism card design, Space Grotesk/Inter fonts
+- **Mock data**: `src/data/mockData.ts` — 10 realistic Altea properties with opportunity scores
+- **Supabase-ready**: TypeScript interfaces defined in mockData.ts for easy backend swap
+
 ## Key Commands
 
 - `pnpm run typecheck` — full typecheck across all packages

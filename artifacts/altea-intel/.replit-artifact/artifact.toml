@@ -1,0 +1,31 @@
+kind = "web"
+previewPath = "/"
+title = "Altea Intel — Luxury Real Estate Dashboard"
+version = "1.0.0"
+id = "artifacts/altea-intel"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 23243
+
+[services.development]
+run = "pnpm --filter @workspace/altea-intel run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/altea-intel", "run", "build" ]
+publicDir = "artifacts/altea-intel/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "23243"
+BASE_PATH = "/"

@@ -1,0 +1,26 @@
+Objetivo: Crear el frontend de una aplicación de inteligencia inmobiliaria de lujo para el mercado de Altea, España. El diseño debe ser moderno, limpio y orientado a datos, utilizando React, Tailwind CSS y Lucide React para los iconos.
+Estética Visual:
+Tema: Modo oscuro sofisticado (Slate-900) con acentos en dorado (Amber-500) o verde esmeralda para indicar ganancias/oportunidades.
+Estilo: Glassmorphism (tarjetas con fondos ligeramente transparentes y bordes sutiles).
+Componentes Principales de la UI:
+Sidebar de Navegación:
+Secciones: Dashboard, Oportunidades (Hot), Análisis por Zona, Leads de Facebook, Configuración.
+Panel Superior de KPIs (Resumen de Mercado):
+Card 1: Precio Medio m² Altea (con indicador de tendencia).
+Card 2: Nuevas Propiedades (24h).
+Card 3: Mejor Oportunidad Detectada (Score más alto).
+Card 4: Total Propiedades en Trackeo.
+Filtros de Zona (Segmentación Altea):
+Un selector rápido para filtrar datos por: Altea Hills, Casco Antiguo, Mascarat/Campomanes, Altea la Vella, Playa/Centro.
+Main View - Grid de Oportunidades:
+Tarjetas de propiedades que muestren: Foto principal (placeholder por ahora), Precio, m², Precio/m², Fuente (Badge de Idealista o Facebook) y el "Opportunity Score" destacado en un círculo radial o badge brillante.
+Tabla de Datos Detallada:
+Una lista con columnas: Título, Zona, Precio, Desviación vs. Media (%), y un pequeño gráfico de línea (Sparkline) que simule el historial de precio.
+Simulación de Datos (Mock Data):
+Crea un archivo mockData.js con 10 propiedades realistas en Altea para que el dashboard no esté vacío. Incluye ejemplos con el "Opportunity Score" calculado (ej. una casa en Altea Hills que vale 1M pero está marcada en 800k debe tener un score de 90).
+Especificaciones Técnicas para la IA:
+Usa Tailwind CSS para todo el estilado.
+Usa Recharts para incluir un gráfico de barras que compare el precio/m² de las 5 zonas de Altea.
+Prepara la estructura de componentes para que más adelante pueda conectar con Supabase (deja listos los tipos o interfaces de TypeScript si es posible).
+Instrucción Final:
+"Por favor, construye primero la estructura de carpetas y luego el layout principal. Quiero que la interfaz se sienta como una herramienta de inversión de alta gama, no como un portal inmobiliario común."
