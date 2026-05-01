@@ -47,3 +47,23 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+
+# Local secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Scraper browser sessions, captured pages and logs
+services/scrapers/*_session/
+services/scrapers/fb_session/
+services/scrapers/html_cache/
+services/scrapers/*.log
+services/scrapers/__pycache__/
+services/scrapers/.pytest_cache/
+
+# Python local environments
+.venv/
+venv/
+__pycache__/
+*.py[cod]
