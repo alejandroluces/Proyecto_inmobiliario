@@ -9,6 +9,7 @@ FIRST-TIME SETUP:
   4. From now on, run without --login and the session is reused automatically.
 """
 import asyncio
+import argparse
 import hashlib
 import logging
 import random
@@ -20,13 +21,26 @@ from typing import Optional
 from playwright.async_api import async_playwright, BrowserContext, Page
 from playwright_stealth import stealth_async
 
-from config import FB_GROUPS, FB_SESSION_DIR
+from config import FB_GROUPS, FB_SESSION_DIR, FB_MAX_POSTS_PER_GROUP, FB_MAX_SCROLLS
 from utils import random_pause, human_scroll, parse_price, parse_m2, detect_zone, is_sale_post
 
 logger = logging.getLogger(__name__)
 
 # How many posts to scroll through per group
-MAX_POSTS_PER_GROUP = 50
+MAX_POSTS_PER_GROUP = FB_MAX_POSTS_PER_GROUP
+MAX_SCROLLS = FB_MAX_SCROLLS
+DIAG_DIR = Path(__file__).parent / "html_cache" / "facebook_diag"
+
+PROPERTY_KEYWORDS = [
+    "apartamento", "apartment", "atico", "ático", "casa", "chalet", "duplex",
+    "dúplex", "estudio", "finca", "inmueble", "local", "loft", "parcela",
+    "piso", "propiedad", "terreno", "villa", "vivienda",
+]
+
+NON_PROPERTY_KEYWORDS = [
+    "bmw", "coche", "car", "moto", "motor", "diesel", "diésel", "transmision",
+    "transmisión", "kilometraje", "km", "vehiculo", "vehículo",
+]
 
 
 async def _get_persistent_context(headless: bool = True) -> tuple:
@@ -96,6 +110,12 @@ def _parse_fb_post_text(text: str) -> Optional[dict]:
     if not is_sale_post(text):
         return None
 
+    lower = text.lower()
+    if any(word in lower for word in NON_PROPERTY_KEYWORDS):
+        return None
+    if not any(word in lower for word in PROPERTY_KEYWORDS):
+        return None
+
     price = parse_price(text)
     m2 = parse_m2(text)
     zone = detect_zone(text)
@@ -132,7 +152,8 @@ async def _scrape_group(context: BrowserContext, group: dict) -> list[dict]:
 
         # Check if we're logged in
         content = await page.content()
-        if "login" in page.url.lower() or "Log in" in content:
+        login_fields = await page.locator("input[name='email'], input[name='pass']").count()
+        if "login" in page.url.lower() or login_fields:
             logger.error(
                 "Not logged in to Facebook! Run:  python scraper_facebook.py --login"
             )
@@ -141,7 +162,7 @@ async def _scrape_group(context: BrowserContext, group: dict) -> list[dict]:
         # Scroll to load posts
         posts_collected = 0
         scroll_attempts = 0
-        max_scrolls = 20
+        max_scrolls = MAX_SCROLLS
 
         while posts_collected < MAX_POSTS_PER_GROUP and scroll_attempts < max_scrolls:
             await human_scroll(page, steps=4)
@@ -155,17 +176,11 @@ async def _scrape_group(context: BrowserContext, group: dict) -> list[dict]:
             for i in range(count):
                 post_el = post_els.nth(i)
 
-                # Get post text
+                # Get full article text. Facebook changes inner message wrappers often,
+                # so the article container is more reliable for first-pass filtering.
                 try:
-                    text_el = post_el.locator("div[data-ad-comet-preview='message'], div[data-testid='post_message']")
-                    if not await text_el.count():
-                        # Fallback: grab all visible text from the article
-                        text_el = post_el.locator("div[dir='auto']")
-
-                    if not await text_el.count():
-                        continue
-
-                    post_text = (await text_el.first.inner_text()).strip()
+                    post_text = (await post_el.inner_text()).strip()
+                    post_text = re.sub(r"\n{3,}", "\n\n", post_text)
                 except Exception:
                     continue
 
@@ -216,6 +231,12 @@ async def _scrape_group(context: BrowserContext, group: dict) -> list[dict]:
                     break
 
         logger.info(f"Group '{group['name']}': {len(results)} sale posts found")
+        if not results:
+            logger.warning(
+                "Group '%s' produced no property-sale posts. The group may be too general, "
+                "not joined, or currently showing non-real-estate posts.",
+                group["name"],
+            )
 
     except Exception as exc:
         logger.error(f"Error scraping FB group {group['name']}: {exc}")
@@ -223,6 +244,58 @@ async def _scrape_group(context: BrowserContext, group: dict) -> list[dict]:
         await page.close()
 
     return results
+
+
+async def diagnose_facebook(headless: bool = False, scrolls: int = 2) -> None:
+    """
+    Short visible diagnostic run. It does not upsert anything; it only confirms
+    login state, article counts and sample extracted text.
+    """
+    DIAG_DIR.mkdir(parents=True, exist_ok=True)
+    pw, context = await _get_persistent_context(headless=headless)
+
+    try:
+        for group in FB_GROUPS:
+            page = await context.new_page()
+            await stealth_async(page)
+            logger.info("Diagnosing FB group: %s", group["name"])
+            await page.goto(group["url"], wait_until="domcontentloaded", timeout=45_000)
+            await asyncio.sleep(5)
+
+            current_url = page.url
+            title = await page.title()
+            html = await page.content()
+            html_path = DIAG_DIR / f"{group['id']}.html"
+            shot_path = DIAG_DIR / f"{group['id']}.png"
+            html_path.write_text(html, encoding="utf-8")
+            await page.screenshot(path=str(shot_path), full_page=False)
+
+            logged_out = "login" in current_url.lower() or "Log in" in html or "Iniciar sesión" in html
+            logger.info("  URL: %s", current_url)
+            logger.info("  Title: %s", title)
+            logger.info("  Logged out/login wall detected: %s", logged_out)
+            logger.info("  Saved: %s and %s", html_path, shot_path)
+
+            for _ in range(scrolls):
+                await human_scroll(page, steps=3)
+                await asyncio.sleep(2)
+
+            articles = page.locator("div[role='article']")
+            article_count = await articles.count()
+            logger.info("  Article elements visible: %s", article_count)
+
+            for idx in range(min(article_count, 5)):
+                try:
+                    text = (await articles.nth(idx).inner_text()).strip()
+                    text = re.sub(r"\s+", " ", text)
+                    logger.info("  Sample article %s: %s", idx + 1, text[:300])
+                except Exception as exc:
+                    logger.info("  Could not read article %s: %s", idx + 1, exc)
+
+            await page.close()
+    finally:
+        await context.close()
+        await pw.stop()
 
 
 async def scrape_facebook() -> list[dict]:
@@ -246,12 +319,33 @@ async def scrape_facebook() -> list[dict]:
     return all_results
 
 
+def configure_limits(max_posts: Optional[int] = None, max_scrolls: Optional[int] = None) -> None:
+    global MAX_POSTS_PER_GROUP, MAX_SCROLLS
+    if max_posts is not None:
+        MAX_POSTS_PER_GROUP = max_posts
+    if max_scrolls is not None:
+        MAX_SCROLLS = max_scrolls
+
+
 # ─── CLI entry point ─────────────────────────────────────────
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    if "--login" in sys.argv:
+    parser = argparse.ArgumentParser(description="Facebook group scraper")
+    parser.add_argument("--login", action="store_true", help="Open visible Facebook login flow")
+    parser.add_argument("--diagnose", action="store_true", help="Short visible diagnostic run")
+    parser.add_argument("--headless", action="store_true", help="Run diagnosis headless")
+    parser.add_argument("--scrolls", type=int, default=2, help="Diagnostic scroll rounds")
+    parser.add_argument("--max-posts", type=int, help="Max sale posts per group")
+    parser.add_argument("--max-scrolls", type=int, help="Max scroll rounds per group")
+    args = parser.parse_args()
+
+    configure_limits(args.max_posts, args.max_scrolls)
+
+    if args.login:
         asyncio.run(login_flow())
+    elif args.diagnose:
+        asyncio.run(diagnose_facebook(headless=args.headless, scrolls=args.scrolls))
     else:
         results = asyncio.run(scrape_facebook())
         print(f"\nTotal FB properties found: {len(results)}")

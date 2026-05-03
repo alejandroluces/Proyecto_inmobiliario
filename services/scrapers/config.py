@@ -2,8 +2,14 @@
 config.py — Centralised configuration loaded from .env
 """
 import os
+import json
+from pathlib import Path
 from dotenv import load_dotenv
 
+SCRAPER_DIR = Path(__file__).resolve().parent
+
+# Always prefer the scraper-specific .env, regardless of the current shell folder.
+load_dotenv(SCRAPER_DIR / ".env")
 load_dotenv()
 
 # ─── Supabase ────────────────────────────────────────────────
@@ -16,6 +22,8 @@ TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # ─── Facebook session ────────────────────────────────────────
 FB_SESSION_DIR: str = os.getenv("FB_SESSION_DIR", "./fb_session")
+FB_MAX_POSTS_PER_GROUP: int = int(os.getenv("FB_MAX_POSTS_PER_GROUP", "50"))
+FB_MAX_SCROLLS: int = int(os.getenv("FB_MAX_SCROLLS", "20"))
 
 # ─── Scraper behaviour ───────────────────────────────────────
 PAUSE_MIN: float = float(os.getenv("PAUSE_MIN", "5"))
@@ -37,6 +45,14 @@ FB_GROUPS = [
         "url": "https://www.facebook.com/groups/358112831484535",
     },
 ]
+
+groups_file = SCRAPER_DIR / "facebook_groups.json"
+if groups_file.exists():
+    FB_GROUPS = json.loads(groups_file.read_text(encoding="utf-8"))
+elif os.getenv("FB_GROUPS_JSON"):
+    FB_GROUPS = json.loads(os.environ["FB_GROUPS_JSON"])
+
+FB_GROUPS = [group for group in FB_GROUPS if group.get("enabled", True) and group.get("url")]
 
 # ─── Zone keyword mapping ────────────────────────────────────
 # Used to detect zone from listing title / description

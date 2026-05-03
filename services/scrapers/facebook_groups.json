@@ -1,0 +1,30 @@
+[
+  {
+    "id": "properties.costa.blanca.spain",
+    "name": "Properties in Costa Blanca & Costa Calida",
+    "url": "https://www.facebook.com/groups/properties.costa.blanca.spain",
+    "enabled": true,
+    "notes": "High-priority real-estate group. Public sources report strong activity."
+  },
+  {
+    "id": "806383410011342",
+    "name": "Grupo Altea & Albir",
+    "url": "https://www.facebook.com/groups/806383410011342",
+    "enabled": true,
+    "notes": "Local Altea/Albir group. Broad content, needs strict property filtering."
+  },
+  {
+    "id": "homes-for-sale-spain-alicante-almeria-murcia-valencia",
+    "name": "Homes for sale in Spain - Alicante - Almeria - Murcia - Valencia",
+    "url": "",
+    "enabled": false,
+    "notes": "Candidate group mentioned by public real-estate sources. Add exact Facebook group URL before enabling."
+  },
+  {
+    "id": "358112831484535",
+    "name": "Milanuncios Alicante",
+    "url": "https://www.facebook.com/groups/358112831484535",
+    "enabled": true,
+    "notes": "Large broad classifieds group. Very noisy; use for discovery only."
+  }
+]

@@ -17,6 +17,7 @@ import asyncio
 import argparse
 import json
 import logging
+import random
 import re
 import time
 from pathlib import Path
@@ -34,7 +35,11 @@ logger = logging.getLogger(__name__)
 SESSION_DIR = Path(__file__).parent / "idealista_session"
 HTML_DIR    = Path(__file__).parent / "html_cache" / "idealista"
 JSON_DIR    = Path(__file__).parent / "html_cache" / "idealista_json"
-MAX_PAGES   = 10
+BLOCK_DIR   = Path(__file__).parent / "html_cache" / "idealista_blocks"
+MAX_PAGES   = 3
+MIN_PAGE_PAUSE = 25
+MAX_PAGE_PAUSE = 65
+CACHE_MAX_AGE_HOURS = 24
 
 
 # ─── Browser setup ───────────────────────────────────────────
@@ -55,11 +60,6 @@ async def _launch_persistent() -> tuple:
         ],
         ignore_default_args=["--enable-automation"],
         viewport={"width": 1366, "height": 768},
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/121.0.0.0 Safari/537.36"
-        ),
         locale="es-ES",
         timezone_id="Europe/Madrid",
         accept_downloads=False,
@@ -147,6 +147,38 @@ async def _wait_captcha_auto(page: Page, timeout_s: int = 300) -> bool:
     return True
 
 
+async def _polite_pause(min_s: int = MIN_PAGE_PAUSE, max_s: int = MAX_PAGE_PAUSE) -> None:
+    delay = random.uniform(min_s, max_s)
+    logger.info(f"Polite pause before next Idealista page: {delay:.1f}s")
+    await asyncio.sleep(delay)
+
+
+async def _save_block_snapshot(page: Page, page_num: int) -> None:
+    """Save the blocked page for manual diagnosis without retrying aggressively."""
+    BLOCK_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = int(time.time())
+    html_file = BLOCK_DIR / f"blocked_page_{page_num}_{stamp}.html"
+    screenshot_file = BLOCK_DIR / f"blocked_page_{page_num}_{stamp}.png"
+
+    try:
+        html_file.write_text(await page.content(), encoding="utf-8")
+    except Exception as exc:
+        logger.warning(f"Could not save blocked HTML snapshot: {exc}")
+
+    try:
+        await page.screenshot(path=str(screenshot_file), full_page=True)
+    except Exception as exc:
+        logger.warning(f"Could not save blocked screenshot: {exc}")
+
+
+def _cache_is_fresh(files: list[Path], max_age_hours: int = CACHE_MAX_AGE_HOURS) -> bool:
+    if not files:
+        return False
+    newest = max(f.stat().st_mtime for f in files)
+    age_hours = (time.time() - newest) / 3600
+    return age_hours <= max_age_hours
+
+
 # ─── Phase 1: FETCH ──────────────────────────────────────────
 
 async def fetch_html(max_pages: int = MAX_PAGES) -> list[Path]:
@@ -199,22 +231,29 @@ async def fetch_html(max_pages: int = MAX_PAGES) -> list[Path]:
             await stealth_async(page)
             await _accept_cookies(page)
 
-            # Scroll to trigger lazy loading
+            if await _is_blocked(page):
+                logger.warning(
+                    "Idealista block/CAPTCHA detected on page %s. "
+                    "Saving snapshot and stopping this run.",
+                    page_num,
+                )
+                await _save_block_snapshot(page, page_num)
+                break
+
+            # Scroll to trigger lazy loading without hammering the page.
             for _ in range(4):
-                await page.evaluate("window.scrollBy(0, window.innerHeight * 0.8)")
-                await asyncio.sleep(0.8)
-            await asyncio.sleep(1)
+                await page.evaluate("window.scrollBy(0, window.innerHeight * 0.55)")
+                await asyncio.sleep(random.uniform(1.5, 3.5))
+            await asyncio.sleep(random.uniform(2.0, 5.0))
 
             if await _is_blocked(page):
-                await _wait_captcha_auto(page)
-                try:
-                    await page.goto(url, wait_until="networkidle", timeout=30_000)
-                except Exception:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
-                await _accept_cookies(page)
-                for _ in range(4):
-                    await page.evaluate("window.scrollBy(0, window.innerHeight * 0.8)")
-                    await asyncio.sleep(0.8)
+                logger.warning(
+                    "Idealista block/CAPTCHA detected after scroll on page %s. "
+                    "Saving snapshot and stopping this run.",
+                    page_num,
+                )
+                await _save_block_snapshot(page, page_num)
+                break
 
             # Save results page HTML
             results_html = await page.content()
@@ -236,7 +275,7 @@ async def fetch_html(max_pages: int = MAX_PAGES) -> list[Path]:
             logger.info(f"  ✓ Page {page_num} saved — ~{count} listings")
 
             if page_num < max_pages:
-                await asyncio.sleep(2)
+                await _polite_pause()
 
     finally:
         if intercepted_json:
@@ -421,10 +460,15 @@ def parse_all_html() -> list[dict]:
 
 async def scrape_idealista(max_pages: int = MAX_PAGES) -> list[dict]:
     existing = list(HTML_DIR.glob("results_page_*.html")) if HTML_DIR.exists() else []
-    if not existing:
+    if not _cache_is_fresh(existing):
+        if existing:
+            logger.info(
+                "Idealista cache is older than %s hours; refreshing cached pages",
+                CACHE_MAX_AGE_HOURS,
+            )
         await fetch_html(max_pages=max_pages)
     else:
-        logger.info(f"Using {len(existing)} cached results pages")
+        logger.info(f"Using {len(existing)} fresh cached results pages")
     return parse_all_html()
 
 

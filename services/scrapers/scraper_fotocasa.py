@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 from typing import Optional
 from bs4 import BeautifulSoup
+import httpx
 
 from playwright.async_api import async_playwright, Page, Route, Request
 from playwright_stealth import stealth_async
@@ -35,6 +36,394 @@ SESSION_DIR = Path(__file__).parent / "fotocasa_session"
 HTML_DIR    = Path(__file__).parent / "html_cache" / "fotocasa"
 JSON_DIR    = Path(__file__).parent / "html_cache" / "fotocasa_json"
 MAX_PAGES   = 10
+DETAIL_VALIDATION_LIMIT = 40
+
+
+DETAIL_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+    "Cache-Control": "no-cache",
+}
+
+
+def _clean_external_id(value) -> str:
+    if value is None:
+        return ""
+    match = re.search(r"(\d{6,12})", str(value))
+    return match.group(1) if match else str(value)
+
+
+def _read_price(value) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        for key in ("amount", "value", "price"):
+            parsed = _read_price(value.get(key))
+            if parsed is not None:
+                return parsed
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return parse_price(str(value))
+
+
+def _read_surface(item: dict) -> Optional[float]:
+    value = (
+        item.get("surface")
+        or item.get("area")
+        or item.get("features", {}).get("surface")
+    )
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return parse_m2(str(value))
+
+
+def _detail_cache_path(external_id: str) -> Path:
+    return HTML_DIR / f"listing_{external_id}.html"
+
+
+def _parse_detail_html(html: str) -> dict:
+    soup = BeautifulSoup(html, "html.parser")
+    detail: dict = {}
+
+    price_el = soup.select_one(".re-DetailHeader-price")
+    if price_el:
+        price = parse_price(price_el.get_text(" ", strip=True))
+        if price:
+            detail["price"] = price
+
+    text = soup.get_text(" ", strip=True)
+    if "m²" in text or "m2" in text:
+        surface_patterns = [
+            r"(\d+(?:[.,]\d+)?)\s*m[²2]\s*construidos",
+            r"(\d+(?:[.,]\d+)?)\s*m[²2]\s*útiles",
+            r"(\d+(?:[.,]\d+)?)\s*m[²2](?!\s*terreno)",
+        ]
+        for pattern in surface_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                m2 = parse_m2(match.group(0))
+                if m2:
+                    detail["m2"] = m2
+                    break
+
+    title_el = soup.select_one("h1")
+    if title_el:
+        title = title_el.get_text(" ", strip=True)
+        if "sentimos la interrupción" in title.lower():
+            return {}
+        if title:
+            detail["title"] = title
+
+    images = []
+    for img in soup.select("img[src*='static.fotocasa.es/images/ads/']"):
+        src = img.get("src")
+        if src and src not in images:
+            images.append(src)
+        if len(images) >= 5:
+            break
+    if images:
+        detail["images"] = images
+
+    return detail if detail.get("price") else {}
+
+
+def _fetch_detail_override(prop: dict) -> dict:
+    external_id = str(prop.get("external_id") or "")
+    url = prop.get("url")
+    if not external_id or not url:
+        return {}
+
+    cache_path = _detail_cache_path(external_id)
+    html = ""
+    if cache_path.exists():
+        html = cache_path.read_text(encoding="utf-8", errors="ignore")
+    else:
+        try:
+            with httpx.Client(headers=DETAIL_HEADERS, follow_redirects=True, timeout=30) as client:
+                response = client.get(url)
+                response.raise_for_status()
+                html = response.text
+            parsed = _parse_detail_html(html)
+            if parsed:
+                cache_path.write_text(html, encoding="utf-8")
+                return parsed
+            return {}
+        except Exception as exc:
+            logger.warning(f"  Could not validate Fotocasa detail {external_id}: {exc}")
+            return {}
+
+    return _parse_detail_html(html)
+
+
+def _needs_detail_validation(prop: dict) -> bool:
+    price = prop.get("price")
+    m2 = prop.get("m2")
+    if not price or not m2:
+        return False
+
+    price_per_m2 = price / m2
+    description = (prop.get("description") or "").lower()
+    luxury_terms = ("ático", "atico", "frente el mar", "primera línea", "primerísima", "lujo")
+
+    return (
+        (m2 >= 120 and price < 700_000 and price_per_m2 < 1_500)
+        or (price < 800_000 and any(term in description for term in luxury_terms))
+    )
+
+
+def _apply_detail_validations(props: list[dict]) -> list[dict]:
+    validated = 0
+    candidates = [prop for prop in props if _needs_detail_validation(prop)]
+    candidates.sort(
+        key=lambda prop: (
+            0 if any(
+                term in (prop.get("description") or "").lower()
+                for term in ("ático", "atico", "frente el mar", "primera línea", "primerísima", "lujo")
+            ) else 1,
+            (prop.get("price") or 0) / max(prop.get("m2") or 1, 1),
+        )
+    )
+
+    for prop in candidates:
+        if validated >= DETAIL_VALIDATION_LIMIT:
+            break
+
+        detail = _fetch_detail_override(prop)
+        validated += 1
+        if not detail:
+            continue
+
+        old_price = prop.get("price")
+        old_m2 = prop.get("m2")
+        for key in ("price", "m2", "title", "images"):
+            if detail.get(key):
+                prop[key] = detail[key]
+
+        if prop.get("price") != old_price or prop.get("m2") != old_m2:
+            logger.info(
+                "  Detail corrected %s: price %s → %s, m2 %s → %s",
+                prop.get("external_id"),
+                old_price,
+                prop.get("price"),
+                old_m2,
+                prop.get("m2"),
+            )
+
+    if validated:
+        logger.info(f"  Detail-validated {validated} suspicious Fotocasa listings")
+    return props
+
+
+def _detail_validation_candidates(props: list[dict]) -> list[dict]:
+    candidates = [prop for prop in props if _needs_detail_validation(prop)]
+    candidates.sort(
+        key=lambda prop: (
+            0 if any(
+                term in (prop.get("description") or "").lower()
+                for term in ("ático", "atico", "frente el mar", "primera línea", "primerísima", "lujo")
+            ) else 1,
+            (prop.get("price") or 0) / max(prop.get("m2") or 1, 1),
+        )
+    )
+    return candidates[:DETAIL_VALIDATION_LIMIT]
+
+
+async def _apply_browser_detail_validations(props: list[dict]) -> list[dict]:
+    candidates = _detail_validation_candidates(props)
+    if not candidates:
+        return props
+
+    pw = context = page = None
+    validated = 0
+    try:
+        pw, context = await _launch_persistent()
+        page = await context.new_page()
+        await stealth_async(page)
+        await _accept_cookies(page)
+
+        for prop in candidates:
+            url = prop.get("url")
+            if not url:
+                continue
+            external_id = str(prop.get("external_id") or "")
+            cache_path = _detail_cache_path(external_id)
+            if cache_path.exists():
+                detail = _parse_detail_html(cache_path.read_text(encoding="utf-8", errors="ignore"))
+                if detail:
+                    old_price = prop.get("price")
+                    old_m2 = prop.get("m2")
+                    for key in ("price", "m2", "title", "images"):
+                        if detail.get(key):
+                            prop[key] = detail[key]
+                    validated += 1
+                    if prop.get("price") != old_price or prop.get("m2") != old_m2:
+                        logger.info(
+                            "  Cached detail corrected %s: price %s → %s, m2 %s → %s",
+                            prop.get("external_id"),
+                            old_price,
+                            prop.get("price"),
+                            old_m2,
+                            prop.get("m2"),
+                        )
+                    continue
+
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+                await _accept_cookies(page)
+                await page.wait_for_timeout(1500)
+                html = await page.content()
+            except Exception as exc:
+                logger.warning(f"  Browser detail validation failed for {prop.get('external_id')}: {exc}")
+                continue
+
+            detail = _parse_detail_html(html)
+            if not detail:
+                continue
+
+            old_price = prop.get("price")
+            old_m2 = prop.get("m2")
+            for key in ("price", "m2", "title", "images"):
+                if detail.get(key):
+                    prop[key] = detail[key]
+            _detail_cache_path(str(prop.get("external_id"))).write_text(html, encoding="utf-8")
+            validated += 1
+
+            if prop.get("price") != old_price or prop.get("m2") != old_m2:
+                logger.info(
+                    "  Browser detail corrected %s: price %s → %s, m2 %s → %s",
+                    prop.get("external_id"),
+                    old_price,
+                    prop.get("price"),
+                    old_m2,
+                    prop.get("m2"),
+                )
+    finally:
+        if page:
+            await page.close()
+        if context:
+            await context.close()
+        if pw:
+            await pw.stop()
+
+    if validated:
+        logger.info(f"  Browser detail-validated {validated} suspicious Fotocasa listings")
+    return props
+
+
+def _embedded_listing_overrides(html: str) -> dict[str, dict]:
+    """
+    Fotocasa embeds listing payloads in the results HTML. Prefer those raw
+    numeric values over visible card text because card text can omit the first
+    million digit in some rendered states.
+    """
+    overrides: dict[str, dict] = {}
+
+    for match in re.finditer(r'\\"(?:id|propertyId)\\"\s*:\s*(\d{6,12})', html):
+        ext_id = match.group(1)
+        window = html[max(0, match.start() - 4000): match.start() + 10000]
+        data = overrides.setdefault(ext_id, {})
+
+        raw_price = re.search(r'\\"rawPrice\\"\s*:\s*(\d{5,9})', window)
+        if raw_price:
+            data["price"] = float(raw_price.group(1))
+        else:
+            price_text = re.search(r'\\"price\\"\s*:\s*\\"([^"]+)\\"', window)
+            if price_text:
+                parsed = parse_price(price_text.group(1).replace("\\u20AC", "EUR"))
+                if parsed:
+                    data["price"] = parsed
+
+        surface = re.search(
+            r'\\"key\\"\s*:\s*\\"surface\\"[^{}]{0,120}?\\"value\\"\s*:\s*(\d+(?:\.\d+)?)',
+            window,
+        )
+        if surface:
+            data["m2"] = float(surface.group(1))
+
+    return overrides
+
+
+def _unescape_json_text(value: str) -> str:
+    try:
+        return json.loads(f'"{value}"')
+    except Exception:
+        return value.replace("\\/", "/").replace("\\u20AC", "EUR")
+
+
+def _parse_embedded_listings(html: str) -> list[dict]:
+    """
+    Extract listing records from Fotocasa's embedded payload. This catches
+    listings whose visual cards are not parsed cleanly and uses raw numeric
+    values such as rawPrice.
+    """
+    records: list[dict] = []
+    seen: set[str] = set()
+
+    for match in re.finditer(r'\\"(?:id|propertyId)\\"\s*:\s*(\d{6,12})', html):
+        ext_id = match.group(1)
+        if ext_id in seen:
+            continue
+
+        window = html[max(0, match.start() - 6000): match.start() + 14000]
+        override = _embedded_listing_overrides(window).get(ext_id, {})
+        price = override.get("price")
+        m2 = override.get("m2")
+
+        if price is None:
+            continue
+
+        detail = ""
+        for pattern in [
+            r'\\"detailWithParams\\"\s*:\s*\{\\"es-ES\\"\s*:\s*\\"([^"]+)\\"',
+            r'\\"detail\\"\s*:\s*\{\\"es-ES\\"\s*:\s*\\"([^"]+)\\"',
+            r'\\"detailUrl\\"\s*:\s*\\"([^"]+)\\"',
+        ]:
+            detail_match = re.search(pattern, window)
+            if detail_match:
+                detail = _unescape_json_text(detail_match.group(1))
+                break
+        url = f"https://www.fotocasa.es{detail}" if detail.startswith("/") else detail
+
+        description_match = re.search(r'\\"description\\"\s*:\s*\\"(.*?)\\"(?:,\\"detail\\"|,\\"detailUrl\\")', window)
+        description = _unescape_json_text(description_match.group(1)) if description_match else ""
+
+        zone_text = " ".join(
+            _unescape_json_text(m.group(1))
+            for m in re.finditer(r'\\"(?:address|zone|municipality|locality)\\"\s*:\s*\\"([^"]+)\\"', window)
+        )
+        zone = detect_zone(zone_text) or detect_zone(description)
+
+        images = []
+        for img_match in re.finditer(r'\\"(?:src|url)\\"\s*:\s*\\"(https://static\.fotocasa\.es/images/ads/[^"]+)\\"', window):
+            src = _unescape_json_text(img_match.group(1))
+            if src and src not in images:
+                images.append(src)
+            if len(images) >= 5:
+                break
+
+        records.append({
+            "source": "Fotocasa",
+            "external_id": ext_id,
+            "url": url or f"https://www.fotocasa.es/es/comprar/vivienda/altea/{ext_id}/d",
+            "title": f"Propiedad Fotocasa {ext_id}",
+            "description": description,
+            "price": price,
+            "m2": m2,
+            "zone": zone,
+            "images": images,
+        })
+        seen.add(ext_id)
+
+    return records
 
 
 # ─── Browser setup ───────────────────────────────────────────
@@ -282,26 +671,31 @@ def _parse_from_json(data: dict) -> list[dict]:
     if isinstance(items, list):
         for item in items:
             try:
-                ext_id = str(item.get("id") or item.get("realEstateId") or "")
+                ext_id = _clean_external_id(
+                    item.get("propertyId")
+                    or item.get("realEstateId")
+                    or item.get("id")
+                )
                 if not ext_id:
                     continue
-                price_raw = item.get("price") or item.get("priceInfo", {}).get("price") or 0
-                price = float(price_raw) if price_raw else None
-                m2_raw = item.get("surface") or item.get("area") or 0
-                m2 = float(m2_raw) if m2_raw else None
+                price = _read_price(item.get("price") or item.get("priceInfo", {}).get("price"))
+                m2 = _read_surface(item)
                 title = item.get("title") or item.get("name") or f"Propiedad Fotocasa {ext_id}"
-                url = item.get("url") or f"https://www.fotocasa.es/es/comprar/viviendas/altea/{ext_id}"
+                url = item.get("url") or item.get("detailUrl") or f"https://www.fotocasa.es/es/comprar/viviendas/altea/{ext_id}"
                 if url.startswith("/"):
                     url = f"https://www.fotocasa.es{url}"
                 location = item.get("location") or item.get("address") or {}
                 zone_text = (
                     location.get("neighborhood") or
                     location.get("district") or
+                    location.get("municipality") or
+                    location.get("address") or
+                    location.get("zone") or
                     location.get("city") or ""
                 ) if isinstance(location, dict) else str(location)
                 zone = detect_zone(zone_text) or detect_zone(title)
                 images = []
-                for img in (item.get("images") or item.get("multimedia") or [])[:5]:
+                for img in (item.get("images") or item.get("multimedias") or item.get("multimedia") or [])[:5]:
                     src = img.get("url") or img.get("src") or (img if isinstance(img, str) else "")
                     if src:
                         images.append(src)
@@ -338,7 +732,7 @@ def _parse_card_html(card, soup: BeautifulSoup) -> Optional[dict]:
 
         # Price: search for patterns like "350.000 €" or "1.200.000€" in the card text
         price = None
-        price_match = re.search(r"([\d]{2,4}(?:[.,]\d{3})*)\s*€", all_text)
+        price_match = re.search(r"(\d{1,4}(?:[.,]\d{3})*)\s*€", all_text)
         if price_match:
             price_str = price_match.group(1).replace(".", "").replace(",", "")
             try:
@@ -428,6 +822,14 @@ def parse_all_html() -> list[dict]:
         for f in results_files:
             html = f.read_text(encoding="utf-8")
             soup = BeautifulSoup(html, "html.parser")
+            embedded_overrides = _embedded_listing_overrides(html)
+
+            embedded_count = 0
+            for prop in _parse_embedded_listings(html):
+                if prop["external_id"] not in seen_ids:
+                    seen_ids.add(prop["external_id"])
+                    results.append(prop)
+                    embedded_count += 1
 
             cards = (
                 soup.select("article.re-CardPackMinimal") or
@@ -440,12 +842,17 @@ def parse_all_html() -> list[dict]:
             for card in cards:
                 prop = _parse_card_html(card, soup)
                 if prop and prop["external_id"] not in seen_ids:
+                    override = embedded_overrides.get(prop["external_id"])
+                    if override:
+                        prop.update({k: v for k, v in override.items() if v is not None})
                     seen_ids.add(prop["external_id"])
                     results.append(prop)
                     page_count += 1
 
             if page_count:
                 logger.info(f"  {f.name}: +{page_count} properties")
+            if embedded_count:
+                logger.info(f"  {f.name}: +{embedded_count} embedded properties")
 
     # Filter out "precio a consultar" (no price, no m²)
     valid = [p for p in results if p.get("price") or p.get("m2")]
@@ -465,7 +872,8 @@ async def scrape_fotocasa(max_pages: int = MAX_PAGES) -> list[dict]:
         await fetch_html(max_pages=max_pages)
     else:
         logger.info(f"Using {len(existing)} cached results pages")
-    return parse_all_html()
+    props = parse_all_html()
+    return await _apply_browser_detail_validations(props)
 
 
 # ─── CLI ─────────────────────────────────────────────────────
